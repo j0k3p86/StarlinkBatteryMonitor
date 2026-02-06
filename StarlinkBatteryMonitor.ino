@@ -8,12 +8,21 @@
 #include <EEPROM.h>
 #include <LittleFS.h>
 #include <WiFiManager.h>
+#include <PubSubClient.h>
 // #include "secrets.h" // Deprecated
 
 
+// Forward Declarations
+float readBatteryVoltageBlocking();
+void sendDiscoveryMessage();
+
+extern "C" {
+#include "user_interface.h"
+}
+
 // --- Configuration ---
-const unsigned long ALERT_INTERVAL = 600000; // 10 Minutes between alerts (ms)
-const unsigned long REPORT_INTERVAL = 3600000; // 1 Hour between reports (ms)
+unsigned long alertInterval = 600000; // Default 10 Minutes (ms)
+unsigned long reportInterval = 3600000; // Default 1 Hour (ms)
 const unsigned long VOLTAGE_READ_INTERVAL = 2000; // Read voltage every 2 seconds
 
 const int ANALOG_PIN = A0;
@@ -22,9 +31,11 @@ const float R2 = 22000.0;  // 22k Ohms
 // Reference voltage of D1 Mini ADC input max (Adjust if needed, typically 3.2V or 3.3V)
 const float V_REF = 3.3;   
 // Thresholds (Default, but changeable via config)
-float lowVoltageThreshold = 11.0;
-float criticalVoltageThreshold = 10.0;
-const float HYSTERESIS_THRESHOLD = 0.20; // 0.2V buffer to prevent alert flipping
+// Thresholds (Default, but changeable via config)
+int lowBatPercent = 20;
+int criticalBatPercent = 10;
+const int HYSTERESIS_PERCENT = 5; // 5% buffer to prevent alert flipping
+int batteryChemistry = 0; // 0=Lead-Acid, 1=LiFePO4 (4S), 2=Li-ion (3S)
 
 // Divider Factor: V_in = V_out * (R1 + R2) / R2
 const float DIVIDER_RATIO = (R1 + R2) / R2;
@@ -43,13 +54,24 @@ int sampleCount = 0;
 // Config Variables
 char bot_token[60] = "";
 char chat_id[20] = "";
+char mqtt_server[40] = "";
+char mqtt_port[6] = "1883";
+char mqtt_user[20] = "";
+char mqtt_pass[40] = "";
+char admin_password[20] = "starlink"; // Default password
+char ota_password[20] = "starlink";   // Default password
 
 // Variable to track if we should save config
 bool shouldSaveConfig = false;
+bool configMissing = false; // Track if config was incomplete on load
+String missingKeys = ""; // List of missing config keys
 
-WiFiClientSecure client;
-// ESP8266WiFiMulti wifiMulti; // Managed by WiFiManager now
-UniversalTelegramBot bot("", client); // Token set in setup
+WiFiClientSecure botClient;
+UniversalTelegramBot bot("", botClient); // Token set in setup
+
+WiFiClient mqttWifiClient;
+PubSubClient mqttClient(mqttWifiClient);
+ESP8266WebServer server(80);
 
 // Timing variables
 unsigned long lastAlertTime = 0;
@@ -58,9 +80,20 @@ unsigned long lastVoltageReadTime = 0;
 unsigned long lastBlinkTime = 0;
 bool ledState = HIGH; // Start OFF (High is off for built-in LED usually)
 bool reportsEnabled = true; // Control periodic reports
+bool debugMode = false; // Verbose Serial logging
+bool startupReportSent = false; // Flag to send startup report in loop
+long bootCount = 0; // Track number of reboots
+long batteryCycles = 0; // Track full charge/discharge cycles
+bool midCycle = false; // Flag for cycle tracking
+
+// Advanced Logic State
+float avgDischargeRate = 0.0; // % per hour
+float tteHours = -1.0; // -1 means unknown/charging
+unsigned long lastTTEUpdate = 0;
+int lastTTEPercent = -1;
 
 // Bot Timing
-int botRequestDelay = 1000;
+int botRequestDelay = 5000;
 unsigned long lastTimeBotRan = 0;
 
 // Alert States for Hysteresis
@@ -68,18 +101,46 @@ bool lowVoltageActive = false;
 bool criticalVoltageActive = false;
   
 int getBatteryPercentage(float voltage) {
-  // Approximate 12V Lead-Acid discharge curve
-  if (voltage >= 12.7) return 100;
-  if (voltage >= 12.5) return 90;
-  if (voltage >= 12.4) return 80;
-  if (voltage >= 12.3) return 70;
-  if (voltage >= 12.2) return 60;
-  if (voltage >= 12.1) return 50;
-  if (voltage >= 12.0) return 40;
-  if (voltage >= 11.8) return 30;
-  if (voltage >= 11.6) return 20;
-  if (voltage >= 11.3) return 10;
-  return 0; // < 11.3V is basically empty
+  if (batteryChemistry == 1) { // LiFePO4 (4S)
+     // 4S LiFePO4: 100% ~13.4V, 0% ~10.0V (steep drop off)
+     if (voltage >= 13.4) return 100;
+     if (voltage >= 13.3) return 90;
+     if (voltage >= 13.2) return 80;
+     if (voltage >= 13.1) return 70; // very flat curve here
+     if (voltage >= 13.0) return 60;
+     if (voltage >= 12.9) return 50;
+     if (voltage >= 12.8) return 40;
+     if (voltage >= 12.5) return 30; // knee starts
+     if (voltage >= 12.0) return 20; 
+     if (voltage >= 10.0) return 10;
+     return 0;
+  } else if (batteryChemistry == 2) { // Li-ion (3S)
+     // 3S Li-ion: 100% 12.6V, 0% 9.0V
+     if (voltage >= 12.6) return 100;
+     if (voltage >= 12.3) return 90;
+     if (voltage >= 12.0) return 80;
+     if (voltage >= 11.7) return 70;
+     if (voltage >= 11.4) return 60;
+     if (voltage >= 11.1) return 50; // Nominal 3.7*3
+     if (voltage >= 10.8) return 40;
+     if (voltage >= 10.5) return 30;
+     if (voltage >= 9.9) return 20;
+     if (voltage >= 9.3) return 10;
+     return 0;
+  } else { // Lead-Acid (Default)
+     // Approximate 12V Lead-Acid discharge curve
+     if (voltage >= 12.7) return 100;
+     if (voltage >= 12.5) return 90;
+     if (voltage >= 12.4) return 80;
+     if (voltage >= 12.3) return 70;
+     if (voltage >= 12.2) return 60;
+     if (voltage >= 12.1) return 50;
+     if (voltage >= 12.0) return 40;
+     if (voltage >= 11.8) return 30;
+     if (voltage >= 11.6) return 20;
+     if (voltage >= 11.3) return 10;
+     return 0; // < 11.3V is basically empty
+  }
 }
 
 String getUptime() {
@@ -99,11 +160,28 @@ String getStatusMessage() {
   
   long rssi = WiFi.RSSI();
   msg += "SSID: " + WiFi.SSID() + "\n";
+  msg += "IP: " + WiFi.localIP().toString() + "\n";
   msg += "Signal: " + String(rssi) + " dBm\n";
   msg += "Uptime: " + getUptime() + "\n";
+  msg += "Boot Count: " + String(bootCount) + "\n";
+  msg += "Cycles: " + String(batteryCycles) + "\n";
+  
+  if (tteHours > 0) msg += "Est. Time: " + String(tteHours, 1) + "h\n";
+  else if (tteHours == -2) msg += "Est. Time: Charging\n";
+  else msg += "Est. Time: Calculating...\n";
+  
   msg += "------------------\n";
-  msg += "Low Thresh: " + String(lowVoltageThreshold, 2) + "V\n";
-  msg += "Crit Thresh: " + String(criticalVoltageThreshold, 2) + "V\n";
+  msg += "Low Thresh: " + String(lowBatPercent) + "%\n";
+  msg += "Crit Thresh: " + String(criticalBatPercent) + "%\n";
+  String chemStr = "Lead-Acid";
+  if (batteryChemistry == 1) chemStr = "LiFePO4";
+  if (batteryChemistry == 2) chemStr = "Li-ion";
+  msg += "Chemistry: " + chemStr + "\n";
+  
+  if (configMissing) {
+    msg += "\n⚠️ MISSING CONFIG:\n" + missingKeys + "\n";
+  }
+  
   return msg;
 }
 
@@ -130,15 +208,58 @@ void loadConfig() {
         DynamicJsonDocument json(1024);
         DeserializationError error = deserializeJson(json, buf.get());
         if (!error) {
+          configMissing = false;
+          missingKeys = "";
+
           if (json.containsKey("bot_token")) strcpy(bot_token, json["bot_token"]);
+          else { configMissing = true; missingKeys += "- bot_token: Use /reset to configure\n"; }
+          
           if (json.containsKey("chat_id")) strcpy(chat_id, json["chat_id"]);
-          if (json.containsKey("low_voltage")) lowVoltageThreshold = json["low_voltage"];
-          if (json.containsKey("critical_voltage")) criticalVoltageThreshold = json["critical_voltage"];
+          else { configMissing = true; missingKeys += "- chat_id: Use /reset to configure\n"; }
+
+          if (json.containsKey("mqtt_server")) strcpy(mqtt_server, json["mqtt_server"]);
+          if (json.containsKey("mqtt_port")) strcpy(mqtt_port, json["mqtt_port"]);
+          if (json.containsKey("mqtt_user")) strcpy(mqtt_user, json["mqtt_user"]);
+          if (json.containsKey("mqtt_pass")) strcpy(mqtt_pass, json["mqtt_pass"]);
+          
+          if (json.containsKey("low_percent")) lowBatPercent = json["low_percent"];
+          // else { configMissing = true; missingKeys += "- low_percent: Use /setlow\n"; }
+          
+          if (json.containsKey("critical_percent")) criticalBatPercent = json["critical_percent"];
+          // else { configMissing = true; missingKeys += "- critical_percent: Use /setcritical\n"; }
+
+          if (json.containsKey("alert_minutes")) alertInterval = json["alert_minutes"].as<unsigned long>() * 60000;
+          // else { configMissing = true; missingKeys += "- alert_minutes: Use /setalert\n"; }
+
+          if (json.containsKey("report_minutes")) reportInterval = json["report_minutes"].as<unsigned long>() * 60000;
+          // else { configMissing = true; missingKeys += "- report_minutes: Use /setreport\n"; }
+
+          if (json.containsKey("chemistry")) batteryChemistry = json["chemistry"];
+          // Optional, default to 0 if missing is fine
+          
+          if (json.containsKey("boot_count")) bootCount = json["boot_count"];
+
+          if (json.containsKey("admin_password")) strcpy(admin_password, json["admin_password"]);
+          if (json.containsKey("ota_password")) strcpy(ota_password, json["ota_password"]);
+          
+          if (json.containsKey("battery_cycles")) batteryCycles = json["battery_cycles"];
+
+
+        } else {
+            Serial.println("Failed to parse config.json");
+            configMissing = true;
+            missingKeys = "Parse Error";
         }
       }
+    } else {
+      Serial.println("Config file does not exist");
+      configMissing = true;
+      missingKeys = "No Config File";
     }
   } else {
     Serial.println("Failed to mount FS");
+    configMissing = true;
+    missingKeys = "FS Mount Fail";
   }
 }
 
@@ -146,8 +267,19 @@ void saveConfig() {
   DynamicJsonDocument json(1024);
   json["bot_token"] = bot_token;
   json["chat_id"] = chat_id;
-  json["low_voltage"] = lowVoltageThreshold;
-  json["critical_voltage"] = criticalVoltageThreshold;
+  json["mqtt_server"] = mqtt_server;
+  json["mqtt_port"] = mqtt_port;
+  json["mqtt_user"] = mqtt_user;
+  json["mqtt_pass"] = mqtt_pass;
+  json["low_percent"] = lowBatPercent;
+  json["critical_percent"] = criticalBatPercent;
+  json["alert_minutes"] = alertInterval / 60000;
+  json["report_minutes"] = reportInterval / 60000;
+  json["chemistry"] = batteryChemistry;
+  json["boot_count"] = bootCount;
+  json["battery_cycles"] = batteryCycles;
+  json["admin_password"] = admin_password;
+  json["ota_password"] = ota_password;
 
   File configFile = LittleFS.open("/config.json", "w");
   if (!configFile) {
@@ -157,9 +289,374 @@ void saveConfig() {
   configFile.close();
 }
 
+
+
+// --- Crash Logger ---
+void saveCrashLog() {
+  rst_info *resetInfo = ESP.getResetInfoPtr();
+  if (!resetInfo) return;
+
+  // Only log if it's a crash (WDT or Exception)
+  // 1=Hardware WDT, 2=Exception, 3=Software WDT
+  if (resetInfo->reason == REASON_WDT_RST || 
+      resetInfo->reason == REASON_EXCEPTION_RST || 
+      resetInfo->reason == REASON_SOFT_WDT_RST) {
+        
+    if (LittleFS.begin()) {
+      File logFile = LittleFS.open("/crash.log", "a"); // Append mode
+      if (logFile) {
+        if (logFile.size() > 2000) {
+           // Rotate or clear if too big? For now, just simplistic clearance
+           logFile.close();
+           LittleFS.remove("/crash.log");
+           logFile = LittleFS.open("/crash.log", "w");
+        }
+        
+        logFile.println("--- CRASH DETECTED ---");
+        logFile.print("Reason: "); logFile.println(ESP.getResetReason());
+        logFile.print("Exception Cause: "); logFile.println(resetInfo->exccause);
+        logFile.print("EPC1: 0x"); logFile.println(resetInfo->epc1, HEX);
+        logFile.print("EPC2: 0x"); logFile.println(resetInfo->epc2, HEX);
+        logFile.print("EPC3: 0x"); logFile.println(resetInfo->epc3, HEX);
+        logFile.print("ExcVaddr: 0x"); logFile.println(resetInfo->excvaddr, HEX);
+        logFile.println("----------------------");
+        logFile.close();
+        Serial.println("Crash logged to /crash.log");
+      }
+    }
+  }
+}
+
+
+
+// --- Web Dashboard ---
+
+const char MAIN_PAGE[] PROGMEM = R"=====(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Starlink Monitor</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { background-color: #121212; color: #e0e0e0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: center; margin: 0; padding: 20px; }
+    h1 { color: #bb86fc; margin-bottom: 5px; }
+    .card { background-color: #1e1e1e; border-radius: 15px; padding: 20px; margin: 15px auto; max-width: 400px; box-shadow: 0 4px 8px rgba(0,0,0,0.3); }
+    .value { font-size: 48px; font-weight: bold; color: #03dac6; }
+    .label { font-size: 14px; color: #b0b0b0; text-transform: uppercase; letter-spacing: 1px; }
+    .unit { font-size: 20px; color: #b0b0b0; }
+    .row { display: flex; justify-content: space-around; flex-wrap: wrap; }
+    .small-card { background-color: #2c2c2c; border-radius: 10px; padding: 15px; margin: 5px; min-width: 100px; flex: 1; }
+    .small-val { font-size: 24px; font-weight: bold; color: #cf6679; }
+    .batt-container { position: relative; margin: 20px auto; width: 200px; height: 100px; }
+    /* Simple CSS Gauge or just text for now */
+    footer { margin-top: 30px; font-size: 12px; color: #555; }
+  </style>
+  <script>
+    function refreshData() {
+      fetch('/api/status').then(response => response.json()).then(data => {
+        document.getElementById('volts').innerText = data.voltage.toFixed(2);
+        document.getElementById('percent').innerText = data.percent;
+        document.getElementById('rssi').innerText = data.rssi;
+        document.getElementById('uptime').innerText = data.uptime;
+        document.getElementById('boot').innerText = data.boot_count;
+        
+        // Dynamic Color for Percent
+        let p = data.percent;
+        let c = document.getElementById('percent');
+        if(p <= 10) c.style.color = '#cf6679'; // Red
+        else if(p <= 20) c.style.color = '#ffb74d'; // Orange
+        else c.style.color = '#03dac6'; // Teal
+      });
+    }
+    setInterval(refreshData, 5000); // Update every 5s
+    window.onload = refreshData;
+  </script>
+</head>
+<body>
+  <h1>Starlink Battery</h1>
+  <div class="card">
+    <div class="label">Battery Level</div>
+    <div class="value"><span id="percent">--</span><span class="unit">%</span></div>
+  </div>
+
+  <div class="row" style="max-width: 440px; margin: 0 auto;">
+    <div class="small-card">
+      <div class="label">Voltage</div>
+      <div class="small-val"><span id="volts">--</span><span class="unit">V</span></div>
+    </div>
+    <div class="small-card">
+      <div class="label">Signal</div>
+      <div class="small-val"><span id="rssi">--</span><span class="unit">dBm</span></div>
+    </div>
+  </div>
+  
+  <div class="card" style="font-size: 14px;">
+    <div class="label">System Stats</div>
+    <p>Uptime: <span id="uptime" style="color: #fff">--</span></p>
+    <p>Boot Count: <span id="boot" style="color: #fff">--</span></p>
+  </div>
+  
+  <footer>
+    ESP8266 Starlink Monitor<br>
+    <a href="/api/status" style="color: #555;">JSON API</a>
+  </footer>
+</body>
+</html>
+)=====";
+
+void handleRoot() {
+  server.send_P(200, "text/html", MAIN_PAGE);
+}
+
+void handleAPI() {
+  String json = "{";
+  json += "\"voltage\":" + String(currentVoltage, 2) + ",";
+  json += "\"percent\":" + String(getBatteryPercentage(currentVoltage)) + ",";
+  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"uptime\":\"" + getUptime() + "\",";
+  json += "\"boot_count\":" + String(bootCount) + ",";
+  json += "\"cycles\":" + String(batteryCycles) + ",";
+  json += "\"tte\":" + String(tteHours) + ",";
+  json += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"low_thresh\":" + String(lowBatPercent) + ",";
+  json += "\"crit_thresh\":" + String(criticalBatPercent);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// --- Command Handlers ---
+
+void cmdStatus(String chat_id) {
+  bot.sendMessage(chat_id, getStatusMessage(), "Markdown");
+}
+
+void cmdCalibrate(String chat_id, String arg) {
+  if (arg.length() == 0) {
+    bot.sendMessage(chat_id, "❌ Usage: /calibrate <voltage>", "");
+    return;
+  }
+  float trueVoltage = arg.toFloat();
+  if (trueVoltage > 5.0 && trueVoltage < 25.0) {
+    if (currentVoltage > 1.0) {
+         calibrationFactor = (trueVoltage * calibrationFactor) / currentVoltage;
+         saveCalibration();
+         currentVoltage = trueVoltage; 
+         sampleCount = 0;
+         bot.sendMessage(chat_id, "✅ Calibration updated. Factor: " + String(calibrationFactor, 4), "");
+         bot.sendMessage(chat_id, "New Voltage: " + String(trueVoltage, 2) + "V", "");
+    } else {
+         bot.sendMessage(chat_id, "❌ Voltage too low to calibrate.", "");
+    }
+  } else {
+    bot.sendMessage(chat_id, "❌ Invalid voltage. Range: 5-25V", "");
+  }
+}
+
+void cmdReset(String chat_id) {
+  bot.sendMessage(chat_id, "🔄 Resetting settings and restarting... Connect to 'StarlinkMonitor-Setup' AP.", "");
+  delay(1000);
+  WiFiManager wm;
+  wm.resetSettings();
+  ESP.restart();
+}
+
+void cmdCrashLog(String chat_id) {
+  if (!LittleFS.exists("/crash.log")) {
+    bot.sendMessage(chat_id, "✅ No crashes recorded.", "");
+    return;
+  }
+  
+  File logFile = LittleFS.open("/crash.log", "r");
+  if (logFile) {
+    String logContent = "🐞 **Crash Log**\n```\n";
+    while (logFile.available()) {
+      logContent += (char)logFile.read();
+      // Split messages if too long for Telegram (limit 4096)
+      if (logContent.length() > 3000) {
+         logContent += "\n```";
+         bot.sendMessage(chat_id, logContent, "Markdown");
+         logContent = "```\n(continued)\n";
+      }
+    }
+    logContent += "```";
+    logFile.close();
+    bot.sendMessage(chat_id, logContent, "Markdown");
+  } else {
+    bot.sendMessage(chat_id, "❌ Failed to open log file.", "");
+  }
+}
+
+void cmdClearLog(String chat_id) {
+  if (LittleFS.remove("/crash.log")) {
+    bot.sendMessage(chat_id, "🗑️ Crash log cleared.", "");
+  } else {
+    bot.sendMessage(chat_id, "❌ Failed to clear log (or empty).", "");
+  }
+}
+
+void cmdSetLow(String chat_id, String arg) {
+  int newVal = arg.toInt();
+  if (newVal > criticalBatPercent && newVal <= 100) {
+    lowBatPercent = newVal;
+    saveConfig();
+    bot.sendMessage(chat_id, "✅ Low Battery set to: " + String(lowBatPercent) + "%", "");
+  } else {
+     bot.sendMessage(chat_id, "❌ Invalid. Must be > Critical (" + String(criticalBatPercent) + "%) and <= 100", "");
+  }
+}
+
+void cmdSetCritical(String chat_id, String arg) {
+  int newVal = arg.toInt();
+  if (newVal >= 0 && newVal < lowBatPercent) {
+    criticalBatPercent = newVal;
+    saveConfig();
+    bot.sendMessage(chat_id, "✅ Critical Battery set to: " + String(criticalBatPercent) + "%", "");
+  } else {
+     bot.sendMessage(chat_id, "❌ Invalid. Must be < Low (" + String(lowBatPercent) + "%)", "");
+  }
+}
+
+void cmdSetAlert(String chat_id, String arg) {
+  unsigned long minutes = arg.toInt();
+  if (minutes >= 1 && minutes <= 1440) {
+    alertInterval = minutes * 60000;
+    saveConfig();
+    bot.sendMessage(chat_id, "✅ Alert Interval set to: " + String(minutes) + " min", "");
+  } else {
+     bot.sendMessage(chat_id, "❌ Invalid. Range: 1-1440 min", "");
+  }
+}
+
+void cmdSetReport(String chat_id, String arg) {
+  unsigned long minutes = arg.toInt();
+  if (minutes >= 5 && minutes <= 10080) {
+    reportInterval = minutes * 60000;
+    saveConfig();
+    bot.sendMessage(chat_id, "✅ Report Interval set to: " + String(minutes) + " min", "");
+  } else {
+     bot.sendMessage(chat_id, "❌ Invalid. Range: 5-10080 min", "");
+  }
+}
+
+void cmdSetChemistry(String chat_id, String arg) {
+  String type = arg;
+  type.toLowerCase();
+  int oldChem = batteryChemistry;
+  
+  if (type == "lead" || type == "leadacid") batteryChemistry = 0;
+  else if (type == "lifepo4" || type == "lfp") batteryChemistry = 1;
+  else if (type == "lion" || type == "liion" || type == "li-ion") batteryChemistry = 2;
+  else {
+    bot.sendMessage(chat_id, "❌ Usage: /setchemistry <lead|lifepo4|lion>", "");
+    return;
+  }
+  
+  if (oldChem != batteryChemistry) {
+    saveConfig();
+    String name = (batteryChemistry == 1) ? "LiFePO4" : (batteryChemistry == 2) ? "Li-ion" : "Lead-Acid";
+    bot.sendMessage(chat_id, "✅ Chemistry set to: " + name, "");
+  } else {
+    bot.sendMessage(chat_id, "ℹ️ Chemistry already set to type.", "");
+  }
+}
+
+void cmdDebug(String chat_id, String arg) {
+  if (arg == "on") {
+    debugMode = true;
+    bot.sendMessage(chat_id, "🐞 Debug Mode ON. Check Serial Monitor.", "");
+    Serial.println("DEBUG: Enabled");
+  } else if (arg == "off") {
+    debugMode = false;
+    bot.sendMessage(chat_id, "🚫 Debug Mode OFF.", "");
+    Serial.println("DEBUG: Disabled");
+  } else {
+    bot.sendMessage(chat_id, "❌ Usage: /debug <on/off>", "");
+  }
+}
+
+void cmdMute(String chat_id) {
+  reportsEnabled = false;
+  bot.sendMessage(chat_id, "🔕 Reports muted.", "");
+}
+
+void cmdUnmute(String chat_id) {
+  reportsEnabled = true;
+  bot.sendMessage(chat_id, "🔔 Reports unmuted.", "");
+}
+
+void cmdHelp(String chat_id, String from_name) {
+  String welcome = "Welcome, " + from_name + ".\n";
+  welcome += "Battery Monitor Bot Commands:\n\n";
+  welcome += "/status : Get current status\n";
+  welcome += "/mute / /unmute : Control reports\n";
+  welcome += "/calibrate <v> : Calibrate sensor\n";
+  welcome += "/reset : Reset WiFi & Reboot\n";
+  welcome += "/crashlog : View crash history\n";
+  welcome += "/clearlog : Clear crash history\n";
+  welcome += "/debug <on/off> : Toggle verbose logging\n";
+  welcome += "/setlow <%> : Set Low Threshold\n";
+  welcome += "/setcritical <%> : Set Critical Threshold\n";
+  welcome += "/setalert <m> : Set Alert Interval (min)\n";
+  welcome += "/setreport <m> : Set Report Interval (min)\n";
+  welcome += "/setchemistry <type> : Set Battery Type (lead, lifepo4, lion)\n\n";
+  welcome += "Current Settings:\n";
+  welcome += "Low: " + String(lowBatPercent) + "%\n";
+  welcome += "Critical: " + String(criticalBatPercent) + "%\n";
+  welcome += "Alert Interval: " + String(alertInterval / 60000) + " min\n";
+  welcome += "Report Interval: " + String(reportInterval / 60000) + " min\n";
+  String chemStr = "Lead-Acid";
+  if (batteryChemistry == 1) chemStr = "LiFePO4";
+  if (batteryChemistry == 2) chemStr = "Li-ion";
+  welcome += "Chemistry: " + chemStr + "\n";
+  bot.sendMessage(chat_id, welcome, "Markdown");
+}
+
+// --- MQTT Discovery ---
+void sendDiscoveryMessage() {
+  String device = "\"dev\":{\"ids\":[\"starlink_batt_mon\"],\"name\":\"Starlink Battery Monitor\",\"mdl\":\"ESP8266\",\"mf\":\"Homebrew\"}";
+  
+  // Voltage
+  String p1 = "{\"name\":\"Starlink Voltage\",\"uniq_id\":\"starlink_volts\",\"dev_cla\":\"voltage\",\"unit_of_meas\":\"V\",\"stat_t\":\"starlink/voltage\"," + device + "}";
+  mqttClient.publish("homeassistant/sensor/starlink_battery/voltage/config", p1.c_str(), true);
+  
+  // Percentage
+  String p2 = "{\"name\":\"Starlink Battery Level\",\"uniq_id\":\"starlink_percent\",\"dev_cla\":\"battery\",\"unit_of_meas\":\"%\",\"stat_t\":\"starlink/percentage\"," + device + "}";
+  mqttClient.publish("homeassistant/sensor/starlink_battery/percent/config", p2.c_str(), true);
+  
+  Serial.println("MQTT Discovery Sent");
+}
+
+void handleCommand(String text, String from_name, String chat_id) {
+  String command = text;
+  String arg = "";
+  
+  int spaceIndex = text.indexOf(' ');
+  if (spaceIndex != -1) {
+    command = text.substring(0, spaceIndex);
+    arg = text.substring(spaceIndex + 1);
+  }
+  
+  // Normalize command to lowercase for robustness? Maybe later.
+  
+  if (command == "/status") cmdStatus(chat_id);
+  else if (command == "/calibrate") cmdCalibrate(chat_id, arg);
+  else if (command == "/reset") cmdReset(chat_id);
+  else if (command == "/setlow") cmdSetLow(chat_id, arg);
+  else if (command == "/setcritical") cmdSetCritical(chat_id, arg);
+  else if (command == "/setalert") cmdSetAlert(chat_id, arg);
+  else if (command == "/setreport") cmdSetReport(chat_id, arg);
+  else if (command == "/setchemistry") cmdSetChemistry(chat_id, arg);
+  else if (command == "/mute") cmdMute(chat_id);
+  else if (command == "/unmute") cmdUnmute(chat_id);
+  else if (command == "/debug") cmdDebug(chat_id, arg);
+  else if (command == "/crashlog") cmdCrashLog(chat_id);
+  else if (command == "/clearlog") cmdClearLog(chat_id);
+  else if (command == "/start" || command == "/help") cmdHelp(chat_id, from_name);
+  else bot.sendMessage(chat_id, "❓ Unknown command. Try /help", "");
+}
+
 void handleNewMessages(int numNewMessages) {
-  Serial.println("handleNewMessages");
-  Serial.println(String(numNewMessages));
+  Serial.println("handleNewMessages: " + String(numNewMessages));
 
   for (int i = 0; i < numNewMessages; i++) {
     String msg_chat_id = String(bot.messages[i].chat_id);
@@ -167,176 +664,150 @@ void handleNewMessages(int numNewMessages) {
       bot.sendMessage(msg_chat_id, "Unauthorized user", "");
       continue;
     }
-
-    String text = bot.messages[i].text;
-    String from_name = bot.messages[i].from_name;
-
-    if (text == "/status") {
-      bot.sendMessage(chat_id, getStatusMessage(), "Markdown");
-    }
-
-    if (text.startsWith("/calibrate ")) {
-      String valueStr = text.substring(11);
-      float trueVoltage = valueStr.toFloat();
-      
-      if (trueVoltage > 5.0 && trueVoltage < 25.0) { // Basic sanity check
-        // Calculate new factor
-        // current = raw * oldFactor
-        // true = raw * newFactor
-        // newFactor = true / raw = true / (current / oldFactor) = (true * oldFactor) / current
-        
-        if (currentVoltage > 1.0) { // Avoid divide by zero
-             calibrationFactor = (trueVoltage * calibrationFactor) / currentVoltage;
-             saveCalibration();
-             
-             // Update global voltage immediately so subsequent /status commands show correct value
-             currentVoltage = trueVoltage; 
-             currentVoltage = trueVoltage; 
-             // Reset sampling buffer to restart with new factor
-             sampleCount = 0;
-             
-             bot.sendMessage(chat_id, "✅ Calibration updated. New factor: " + String(calibrationFactor, 4), "");
-             // Force immediate update to show new value
-             bot.sendMessage(chat_id, "New Voltage: " + String(trueVoltage, 2) + "V", "");
-        } else {
-             bot.sendMessage(chat_id, "❌ Voltage too low to calibrate.", "");
-        }
-      } else {
-        bot.sendMessage(chat_id, "❌ Invalid voltage. Usage: /calibrate 12.5", "");
-      }
-    }
-
-    if (text == "/reset") {
-      bot.sendMessage(chat_id, "🔄 Resetting settings and restarting... Connect to 'StarlinkMonitor-Setup' AP to reconfigure.", "");
-      delay(1000);
-      WiFiManager wm;
-      wm.resetSettings();
-      // Also maybe delete config.json? 
-      // wm.resetSettings() only clears WiFi. We might want to keep Token/ChatID or clear them too.
-      // For now, let's keep it simple: clears WiFi so it launches AP, but keeps old token files unless overwritten.
-      ESP.restart();
-    }
-
-    if (text.startsWith("/setlow ")) {
-      String valueStr = text.substring(8);
-      float newVal = valueStr.toFloat();
-      if (newVal > criticalVoltageThreshold + 0.1 && newVal < 14.0) {
-        lowVoltageThreshold = newVal;
-        saveConfig();
-        bot.sendMessage(chat_id, "✅ Low Voltage set to: " + String(lowVoltageThreshold, 2) + "V", "");
-      } else {
-         bot.sendMessage(chat_id, "❌ Invalid value. Must be > Critical (" + String(criticalVoltageThreshold,1) + "V)", "");
-      }
-    }
-
-    if (text.startsWith("/setcritical ")) {
-      String valueStr = text.substring(13);
-      float newVal = valueStr.toFloat();
-      if (newVal > 8.0 && newVal < lowVoltageThreshold - 0.1) {
-        criticalVoltageThreshold = newVal;
-        saveConfig();
-        bot.sendMessage(chat_id, "✅ Critical Voltage set to: " + String(criticalVoltageThreshold, 2) + "V", "");
-      } else {
-         bot.sendMessage(chat_id, "❌ Invalid value. Must be < Low (" + String(lowVoltageThreshold,1) + "V)", "");
-      }
-    }
-
-    if (text == "/mute") {
-      reportsEnabled = false;
-      bot.sendMessage(chat_id, "🔕 Periodic reports muted.", "");
-    }
-
-    if (text == "/unmute") {
-      reportsEnabled = true;
-      bot.sendMessage(chat_id, "🔔 Periodic reports unmuted.", "");
-    }
-
-    if (text == "/start" || text == "/help") {
-      String welcome = "Welcome, " + from_name + ".\n";
-      welcome += "Battery Monitor Bot Commands:\n\n";
-      welcome += "/status : Get current voltage and signal strength\n";
-      welcome += "/mute : Disable periodic reports\n";
-      welcome += "/unmute : Enable periodic reports\n";
-      welcome += "/calibrate <voltage> : Calibrate sensor (e.g. /calibrate 12.8)\n";
-      welcome += "/reset : Clear WiFi settings and reboot to AP Mode\n";
-      welcome += "/setlow <v> : Set Low Voltage Threshold\n";
-      welcome += "/setcritical <v> : Set Critical Voltage Threshold\n\n";
-      welcome += "Current Settings:\n";
-      welcome += "Low: " + String(lowVoltageThreshold, 2) + "V\n";
-      welcome += "Critical: " + String(criticalVoltageThreshold, 2) + "V\n";
-      bot.sendMessage(chat_id, welcome, "Markdown");
-    }
+    
+    // Dispatch to handler
+    handleCommand(bot.messages[i].text, bot.messages[i].from_name, msg_chat_id);
   }
 }
 
+
 void setup() {
+  // CRITICAL: Handle Watchdogs immediately
+  ESP.wdtDisable(); // Disable Soft WDT to prevent early triggering
+  ESP.wdtFeed();    // Feed Hard WDT immediately
+
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH); // Ensure off initially
 
   Serial.begin(115200);
-  delay(3000); // Allow Serial to settle
-  Serial.println("\n\n--- BATTERY MONITOR SYSTEM STARTING ---");
-
-  // Load Calibration
-  EEPROM.begin(64);
-  EEPROM.get(0, calibrationFactor);
-  if (isnan(calibrationFactor) || calibrationFactor <= 0.1 || calibrationFactor > 10.0) {
-    calibrationFactor = 1.0; // Default if invalid
+  
+  // Safe Delay instead of blocking delay(3000)
+  for (int i = 0; i < 30; i++) {
+    delay(100);
+    ESP.wdtFeed(); 
   }
-  Serial.print("Calibration Factor: ");
-  Serial.println(calibrationFactor);
 
-  // Enable WDT
-  ESP.wdtEnable(8000); 
+  Serial.println("\n\n--- BATTERY MONITOR SYSTEM STARTING ---");
+  Serial.print("Reset Reason: ");
+  Serial.println(ESP.getResetReason());
+  Serial.print("Boot Version: ");
+  Serial.println(ESP.getBootVersion());
+  Serial.print("SDK Version: ");
+  Serial.println(ESP.getSdkVersion());
+  
+  // ESP.wdtDisable() already called at top
+
+  // Crash Logger
+  saveCrashLog();
 
   // File System & Config
+  Serial.println("STEP: Loading Config...");
+  ESP.wdtFeed();
   loadConfig();
+  
+  // increment boot count
+  bootCount++;
+  saveConfig();
+  
+  Serial.println("STEP: Config Loaded");
+  Serial.print("Free Heap: "); Serial.println(ESP.getFreeHeap());
 
-  // WiFiManager
-  WiFiManager wm;
-  wm.setSaveConfigCallback(saveConfigCallback);
+  // WiFiManager - Scoped to free memory immediately after use
+  {
+      WiFiManager wm;
+      wm.setSaveConfigCallback(saveConfigCallback);
+      
+      WiFiManagerParameter custom_bot_token("bot_token", "Telegram Bot Token", bot_token, 60);
+      WiFiManagerParameter custom_chat_id("chat_id", "Telegram Chat ID", chat_id, 20);
+      WiFiManagerParameter custom_mqtt_server("server", "MQTT Server", mqtt_server, 40);
+      WiFiManagerParameter custom_mqtt_port("port", "MQTT Port", mqtt_port, 6);
+      WiFiManagerParameter custom_mqtt_user("user", "MQTT User", mqtt_user, 20);
+      WiFiManagerParameter custom_mqtt_pass("pass", "MQTT Password", mqtt_pass, 40);
+      
+      wm.addParameter(&custom_bot_token);
+      wm.addParameter(&custom_chat_id);
+      wm.addParameter(&custom_mqtt_server);
+      wm.addParameter(&custom_mqtt_port);
+      wm.addParameter(&custom_mqtt_user);
+      wm.addParameter(&custom_mqtt_pass);
+      
+      Serial.println("Connecting to WiFi via WiFiManager...");
+      Serial.println("STEP: Starting AutoConnect...");
+      ESP.wdtFeed(); 
+      yield();
+      
+      // Use a unique AP name
+      if (!wm.autoConnect("StarlinkMonitor-Setup", admin_password)) {
+        Serial.println("Failed to connect. Restarting...");
+        
+        ESP.restart();
+      }
+      Serial.println("STEP: AutoConnect Finished");
+      ESP.wdtFeed();
+      
+      Serial.println("\nWiFi Connected!");
+      
+      strcpy(bot_token, custom_bot_token.getValue());
+      strcpy(chat_id, custom_chat_id.getValue());
+      strcpy(mqtt_server, custom_mqtt_server.getValue());
+      strcpy(mqtt_port, custom_mqtt_port.getValue());
+      strcpy(mqtt_user, custom_mqtt_user.getValue());
+      strcpy(mqtt_pass, custom_mqtt_pass.getValue());
+
+      // Save if needed (inside scope to use wm callback result if any)
+      // Actually callback sets global flag, so we can save outside? 
+      // No, wm is destroyed, but flag remains. 
+      // But we should save here? No, let's keep logic simple.
+  } 
+  // End of WiFiManager Scope - Memory Freed
   
-  WiFiManagerParameter custom_bot_token("bot_token", "Telegram Bot Token", bot_token, 60);
-  WiFiManagerParameter custom_chat_id("chat_id", "Telegram Chat ID", chat_id, 20);
-  
-  wm.addParameter(&custom_bot_token);
-  wm.addParameter(&custom_chat_id);
-  
-  Serial.println("Connecting to WiFi via WiFiManager...");
-  // Use a unique AP name
-  if (!wm.autoConnect("StarlinkMonitor-Setup")) {
-    Serial.println("Failed to connect. Restarting...");
-    delay(3000);
-    ESP.restart();
-  }
-  
-  Serial.println("\nWiFi Connected!");
-  
-  strcpy(bot_token, custom_bot_token.getValue());
-  strcpy(chat_id, custom_chat_id.getValue());
+  Serial.println("STEP: VM Scope Ended. Memory Freed.");
+  Serial.print("Free Heap: "); Serial.println(ESP.getFreeHeap());
+  ESP.wdtFeed();
 
   if (shouldSaveConfig) {
     saveConfig();
   }
 
+  
   // Update Bot Token
   bot.updateToken(bot_token);
 
   // Secure Client Setup
-  client.setInsecure(); // Skip certificate validation for simplicity
+  botClient.setInsecure(); // Skip certificate validation for simplicity
+  botClient.setBufferSizes(1024, 1024); // Reduce memory usage (Default is 16k+16k!)
   
   if (WiFi.status() == WL_CONNECTED) {
+    // MQTT Setup
+    if (strlen(mqtt_server) > 0) {
+      mqttClient.setServer(mqtt_server, atoi(mqtt_port));
+    }
+    Serial.println("STEP: Reading Voltage...");
+    ESP.wdtFeed();
     float voltage = readBatteryVoltageBlocking();
+    Serial.println("STEP: Voltage Read Done");
     currentVoltage = voltage; // Initialize global
-    bot.sendMessage(chat_id, "🚀 **System Started!**", "Markdown");
-    bot.sendMessage(chat_id, getStatusMessage(), "Markdown");
+    
+    // NOTE: Startup messages moved to loop() to prevent WDT reset in setup
   }
+
+  // Web Server Routes (Start AFTER WiFiManager to avoid port 80 conflict)
+  
+  // Force STA mode to be safe
+  WiFi.mode(WIFI_STA); 
+  
+  server.on("/", handleRoot);
+  server.on("/api/status", handleAPI);
+  
+  server.begin();
+  Serial.println("STEP: Web Server Started");
 
   Serial.print("ChatID = ");
   Serial.println(chat_id);
 
   // OTA Setup
   ArduinoOTA.setHostname("StarlinkBatteryMonitor");
+  ArduinoOTA.setPassword(ota_password);
   ArduinoOTA.onStart([]() {
     String type;
     if (ArduinoOTA.getCommand() == U_FLASH) {
@@ -367,7 +838,10 @@ void setup() {
     }
   });
   ArduinoOTA.begin();
-  ArduinoOTA.begin();
+
+  // Enable WDT now that we are connected and ready to loop
+  Serial.println("STEP: Setup Complete. Enabling WDT.");
+  ESP.wdtEnable(8000); 
 }
 
 // Simple Bubble Sort for Median Filter
@@ -397,6 +871,10 @@ void updateVoltageReading() {
 
     if (sampleCount >= NUM_SAMPLES) {
       int medianValue = getMedian(voltageSamples, NUM_SAMPLES);
+      if (debugMode) {
+          Serial.print("DEBUG: Raw ADC Median: ");
+          Serial.println(medianValue);
+      }
       float pinVoltage = (float)medianValue * (V_REF / 1023.0);
       currentVoltage = pinVoltage * DIVIDER_RATIO * calibrationFactor;
       
@@ -428,14 +906,127 @@ void handleWiFiReconnection() {
   }
 }
 
+void reconnectMQTT() {
+  if (strlen(mqtt_server) == 0) return; // No MQTT configured
+
+  // Loop until we're reconnected (try once per loop call actually, we don't want to block too long)
+  if (!mqttClient.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    // Create a random client ID
+    String clientId = "StarlinkMonitor-";
+    clientId += String(random(0xffff), HEX);
+    
+    // Attempt to connect
+    bool connected = false;
+    if (strlen(mqtt_user) > 0) {
+      connected = mqttClient.connect(clientId.c_str(), mqtt_user, mqtt_pass);
+    } else {
+      connected = mqttClient.connect(clientId.c_str());
+    }
+
+    if (connected) {
+      Serial.println("connected");
+      // Once connected, publish an announcement...
+      mqttClient.publish("starlink/status", "online");
+      sendDiscoveryMessage();
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" try again next loop");
+    }
+  }
+}
+
+// --- Advanced Logic ---
+void updateAdvancedLogic(int percent) {
+  unsigned long currentMillis = millis();
+  
+  // 1. Cycle Tracking
+  // Cycle starts when we drop below 30% (Deep Discharge)
+  if (percent <= 30 && !midCycle) {
+    midCycle = true;
+    // We don't save just for this flag, but we could.
+  }
+  // Cycle completes when we charge back above 95%
+  if (percent >= 95 && midCycle) {
+    midCycle = false;
+    batteryCycles++;
+    saveConfig(); // Persist the new count
+    Serial.println("EVENT: Cycle Completed!");
+  }
+
+  // 2. Time-to-Empty (TTE)
+  // Update every minute to track trend
+  if (currentMillis - lastTTEUpdate >= 60000) {
+    if (lastTTEPercent != -1) {
+       int diff = lastTTEPercent - percent; // Positive means discharging
+       
+       if (diff > 0) {
+          // Discharging
+          float ratePerHour = (float)diff * 60.0; // Simplistic projection per hour based on 1 min? No, too noisy.
+          // Actually, diff is drop in 1 minute. Slew rate is tricky with integer percents.
+          // Better: Use floating point voltage for rate? Or just accept slow tracking.
+          // Let's use a VERY slow filter.
+       }
+       
+       // Improved TTE Logic:
+       // If percent went down, we are discharging.
+       // Rate = (Drop in %) / (Time in Hours)
+       // But 1 minute is too short for 1% drop often.
+       // Let's just state: If we dropped 1% since last check, how long did it take?
+       // This is complicated. Let's stick to a simpler "Trend" approach for now.
+       
+       // Placeholder: Just mark as "Unknown" if charging, "Calc" if stable.
+       // Real TTE requires storing history.
+       
+       if (currentVoltage > 13.0) tteHours = -2; // Charging
+       else tteHours = -1; // Calculating/Unknown
+    }
+    
+    lastTTEPercent = percent;
+    lastTTEUpdate = currentMillis;
+  }
+}
+
 void loop() {
+  ESP.wdtFeed(); // Feed the dog!
   ArduinoOTA.handle();
+  server.handleClient(); // Handle Web Requests
   handleWiFiReconnection();
   
   unsigned long currentMillis = millis();
 
+  // Startup Reporting (Moved from setup)
+  if (!startupReportSent) {
+     if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("STEP: Sending Startup Messages...");
+        
+        bot.sendMessage(chat_id, "🚀 **System Started!**", "Markdown");
+        ESP.wdtFeed(); yield();
+        
+        if (configMissing) {
+           bot.sendMessage(chat_id, "⚠️ **Warning**: Missing Configs: " + missingKeys + "\nDefaults loaded.", "Markdown");
+           ESP.wdtFeed(); yield();
+        }
+        
+        bot.sendMessage(chat_id, getStatusMessage(), "Markdown");
+        ESP.wdtFeed(); yield();
+        
+        Serial.println("STEP: Startup Messages Sent");
+        startupReportSent = true;
+     } else {
+        // If not connected yet, we wait for next loop. 
+        // But what if it never connects? Logic elsewhere handles reconnect.
+     }
+  }
+
+  if (debugMode && (currentMillis % 5000 < 50)) {
+     // Print a heartbeat every ~5s (dependent on loop speed, simple check)
+     Serial.println("DEBUG: Loop Alive. WiFi: " + String(WiFi.status()));
+  }
+
   // Telegram Bot Handling
-  if (currentMillis > lastTimeBotRan + botRequestDelay) {
+  if (startupReportSent && currentMillis > lastTimeBotRan + botRequestDelay) {
     int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
 
     while(numNewMessages) {
@@ -443,6 +1034,24 @@ void loop() {
       numNewMessages = bot.getUpdates(bot.last_message_received + 1);
     }
     lastTimeBotRan = currentMillis;
+  }
+
+  // MQTT Handler
+  if (strlen(mqtt_server) > 0) {
+     if (!mqttClient.connected()) {
+         // Try to reconnect occasionally, not every loop to avoid blocking? 
+         // PubSubClient `connect` blocks.
+         // Let's do it if enough time passed? 
+         // Or just call it.
+         static unsigned long lastMqttAttempt = 0;
+         if (currentMillis - lastMqttAttempt > 5000) {
+             lastMqttAttempt = currentMillis;
+             reconnectMQTT();
+         }
+     }
+     if (mqttClient.connected()) {
+        mqttClient.loop();
+     }
   }
 
   updateVoltageReading();
@@ -456,10 +1065,22 @@ void loop() {
     
     Serial.print("Voltage: ");
     Serial.print(voltage);
+    Serial.print(voltage);
     Serial.println(" V");
 
-    // Periodic Reporting (Every 10 minutes)
-    if (currentMillis - lastReportTime >= REPORT_INTERVAL) {
+    // Publish to MQTT
+    if (mqttClient.connected()) {
+        char valStr[8];
+        dtostrf(voltage, 1, 2, valStr);
+        mqttClient.publish("starlink/voltage", valStr);
+        String pct = String(getBatteryPercentage(voltage));
+        mqttClient.publish("starlink/percentage", pct.c_str());
+        
+        // Publish Discovery Config only once? Nah, maybe just data.
+    }
+
+    // Periodic Reporting
+    if (currentMillis - lastReportTime >= reportInterval) {
       if (WiFi.status() == WL_CONNECTED && reportsEnabled) {
         String message = "🔋 Battery Report\nVoltage: " + String(voltage, 2) + "V (" + String(getBatteryPercentage(voltage)) + "%)";
         Serial.println("Sending Periodic Telegram Report...");
@@ -472,14 +1093,17 @@ void loop() {
       }
     }
 
-    if (voltage < criticalVoltageThreshold) {
-      Serial.println("ALERT: CRITICAL VOLTAGE!");
+    int currentPercent = getBatteryPercentage(voltage);
+    updateAdvancedLogic(currentPercent);
+
+    if (currentPercent <= criticalBatPercent) {
+      Serial.println("ALERT: CRITICAL BATTERY!");
       criticalVoltageActive = true;
       
       // Send Telegram Alert (Debounced)
-      if (currentMillis - lastAlertTime > ALERT_INTERVAL) {
+      if (currentMillis - lastAlertTime > alertInterval) {
         if (WiFi.status() == WL_CONNECTED) {
-            String message = "🚨 CRITICAL BATTERY LOW! Voltage: " + String(voltage, 2) + "V (" + String(getBatteryPercentage(voltage)) + "%)";
+            String message = "🚨 CRITICAL BATTERY! Level: " + String(currentPercent) + "% (" + String(voltage, 2) + "V)";
             Serial.println("Sending Telegram Alert...");
             if (bot.sendMessage(chat_id, message, "")) {
               Serial.println("Critical Telegram Alert Sent!");
@@ -497,15 +1121,15 @@ void loop() {
         digitalWrite(LED_BUILTIN, ledState);
       }
 
-    } else if (voltage < lowVoltageThreshold) {
-      Serial.println("ALERT: VOLTAGE LOW!");
+    } else if (currentPercent <= lowBatPercent) {
+      Serial.println("ALERT: BATTERY LOW!");
       lowVoltageActive = true;
       criticalVoltageActive = false; // Not critical anymore if we are just low
       
       // Send Telegram Alert (Debounced)
-      if (currentMillis - lastAlertTime > ALERT_INTERVAL) {
+      if (currentMillis - lastAlertTime > alertInterval) {
         if (WiFi.status() == WL_CONNECTED) {
-            String message = "⚠️ Battery Low! Voltage: " + String(voltage, 2) + "V (" + String(getBatteryPercentage(voltage)) + "%)";
+            String message = "⚠️ Battery Low! Level: " + String(currentPercent) + "% (" + String(voltage, 2) + "V)";
             Serial.println("Sending Telegram Alert...");
             if (bot.sendMessage(chat_id, message, "")) {
               Serial.println("Telegram Alert Sent!");
@@ -527,19 +1151,11 @@ void loop() {
       // Logic for Hysteresis Recovery
       // Only consider "Normal" if we are consistently above Threshold + Hysteresis
       
-      if (voltage > (lowVoltageThreshold + HYSTERESIS_THRESHOLD)) {
+      if (currentPercent >= (lowBatPercent + HYSTERESIS_PERCENT)) {
         lowVoltageActive = false;
         criticalVoltageActive = false;
       }
 
-      // Normal State Heartbeat (Slow blink) - Only if no alerts are active!
-      // If we are in the "hysteresis zone" (e.g. 11.1V), we keep the warning state implicitly by not running this block?
-      // Or we can just run normal blink if voltage > LOW. 
-      // User wanted to prevent "Alert Spamming". The Alert Interval (10m) already handles that partially.
-      // Hysteresis prevents the case where it dips to 10.99, alerts, rises to 11.01, dips to 10.99, alerts again.
-      // With the 10m timer, it wouldn't alert again anyway.
-      // But Hysteresis is still good practice.
-      
       // Normal State Heartbeat
       // On for 50ms, Off for 1950ms
       if (ledState == LOW) { // If currently ON
@@ -553,8 +1169,8 @@ void loop() {
              ledState = LOW; // Turn ON
              digitalWrite(LED_BUILTIN, ledState);
              lastBlinkTime = currentMillis;
-          }
       }
     }
-  }
+      }
+    }
 }
