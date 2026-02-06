@@ -7,7 +7,7 @@ This project is an ESP8266-based battery monitoring system designed to keep trac
 -   **Voltage Monitoring**: continuously reads battery voltage using a voltage divider.
 -   **Telegram Integration**:
     -   Sends a "System Online" message on startup with current voltage.
-    -   Sends periodic status reports every 10 minutes.
+    -   Sends periodic status reports every 1 hour.
     -   Sends **CRITICAL** and **LOW VOLTAGE** alerts immediately when thresholds are breached.
 -   **Dual WiFi Support**: configured to connect to two different WiFi networks for redundancy (using `ESP8266WiFiMulti`).
 -   **Visual Feedback**:
