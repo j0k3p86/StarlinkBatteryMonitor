@@ -4,16 +4,31 @@ This project is an ESP8266-based battery monitoring system designed to keep trac
 
 ## Features
 
--   **Voltage Monitoring**: continuously reads battery voltage using a voltage divider.
+-   **Voltage Monitoring**: Continuously reads battery voltage (non-blocking) using a voltage divider.
 -   **Telegram Integration**:
-    -   Sends a "System Online" message on startup with current voltage.
-    -   Sends periodic status reports every 1 hour.
-    -   Sends **CRITICAL** and **LOW VOLTAGE** alerts immediately when thresholds are breached.
--   **Dual WiFi Support**: configured to connect to two different WiFi networks for redundancy (using `ESP8266WiFiMulti`).
+    -   **Interactive Bot**: Respond to commands like `/status` and `/help`.
+    -   **Startup Report**: Sends a full status report immediately on boot.
+    -   **Periodic Reports**: Sends status reports every **1 hour**.
+    -   **Alerts**: sends **CRITICAL** and **LOW VOLTAGE** alerts immediately when thresholds are breached.
+-   **System Reliability**:
+    -   **Uptime Monitoring**: Reports system uptime.
+    -   **Watchdog Timer (WDT)**: Hardware watchdog enabled to auto-reset if the system hangs.
+    -   **Dual WiFi Support**: Connects to two different WiFi networks for redundancy.
 -   **Visual Feedback**:
     -   **Slow Blink**: Normal operation (Heartbeat).
     -   **Fast Blink**: Low Voltage Warning.
     -   **Very Fast Blink**: Critical Voltage Alert.
+-   **Maintenance**:
+    -   **OTA Support**: Update firmware wirelessly.
+    -   **Calibration**: Calibrate voltage reading via Telegram command.
+
+## Telegram Commands
+
+-   `/status`: Returns current voltage, WiFi SSID, signal strength, and uptime.
+-   `/calibrate <voltage>`: Calibrate the sensor to match a multimeter reading (e.g., `/calibrate 12.8`). Saves execution to EEPROM.
+-   `/mute`: Stop sending periodic hourly reports (alerts still sent).
+-   `/unmute`: Resume periodic reports.
+-   `/help`: List all available commands.
 
 ## Hardware Requirements
 
@@ -42,3 +57,5 @@ Flash the code to your ESP8266 using the Arduino IDE. Ensure the following libra
 -   `ESP8266WiFi`
 -   `UniversalTelegramBot`
 -   `ArduinoJson`
+-   `ArduinoOTA` (Built-in)
+-   `EEPROM` (Built-in)
