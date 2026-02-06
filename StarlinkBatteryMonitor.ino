@@ -10,6 +10,7 @@
 #include <WiFiManager.h>
 // #include "secrets.h" // Deprecated
 
+
 // --- Configuration ---
 const unsigned long ALERT_INTERVAL = 600000; // 10 Minutes between alerts (ms)
 const unsigned long REPORT_INTERVAL = 3600000; // 1 Hour between reports (ms)
@@ -100,6 +101,9 @@ String getStatusMessage() {
   msg += "SSID: " + WiFi.SSID() + "\n";
   msg += "Signal: " + String(rssi) + " dBm\n";
   msg += "Uptime: " + getUptime() + "\n";
+  msg += "------------------\n";
+  msg += "Low Thresh: " + String(lowVoltageThreshold, 2) + "V\n";
+  msg += "Crit Thresh: " + String(criticalVoltageThreshold, 2) + "V\n";
   return msg;
 }
 
@@ -256,7 +260,10 @@ void handleNewMessages(int numNewMessages) {
       welcome += "/calibrate <voltage> : Calibrate sensor (e.g. /calibrate 12.8)\n";
       welcome += "/reset : Clear WiFi settings and reboot to AP Mode\n";
       welcome += "/setlow <v> : Set Low Voltage Threshold\n";
-      welcome += "/setcritical <v> : Set Critical Voltage Threshold\n";
+      welcome += "/setcritical <v> : Set Critical Voltage Threshold\n\n";
+      welcome += "Current Settings:\n";
+      welcome += "Low: " + String(lowVoltageThreshold, 2) + "V\n";
+      welcome += "Critical: " + String(criticalVoltageThreshold, 2) + "V\n";
       bot.sendMessage(chat_id, welcome, "Markdown");
     }
   }

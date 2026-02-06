@@ -10,7 +10,10 @@ This project is an ESP8266-based battery monitoring system designed to keep trac
     -   **Startup Report**: Sends a full status report immediately on boot.
     -   **Periodic Reports**: Sends status reports every **1 hour**.
     -   **Alerts**: sends **CRITICAL** and **LOW VOLTAGE** alerts immediately when thresholds are breached.
+    -   **Dynamic Thresholds**: Configure Low and Critical voltage limits via Telegram commands.
 -   **System Reliability**:
+    -   **Hysteresis**: Prevents alert flooding by requiring voltage to rise 0.2V above threshold to clear.
+    -   **Battery Percentage**: Displays estimated charge % (12V Lead-Acid curve).
     -   **Uptime Monitoring**: Reports system uptime.
     -   **Watchdog Timer (WDT)**: Hardware watchdog enabled to auto-reset if the system hangs.
     -   **Dual WiFi Support**: Connects to two different WiFi networks for redundancy.
@@ -24,14 +27,13 @@ This project is an ESP8266-based battery monitoring system designed to keep trac
 
 ## Telegram Commands
 
--   `/status`: Returns current voltage, WiFi SSID, signal strength, and uptime.
--   `/calibrate <voltage>`: Calibrate the sensor to match a multimeter reading (e.g., `/calibrate 12.8`). Saves execution to EEPROM.
+-   `/status`: Returns voltage, percentage, WiFi signal, uptime, and current thresholds.
+-   `/calibrate <voltage>`: Calibrate the sensor to match a multimeter reading (e.g., `/calibrate 12.8`).
 -   `/setlow <voltage>`: Set the Low Voltage Warning threshold (default 11.0V).
 -   `/setcritical <voltage>`: Set the Critical Voltage Alert threshold (default 10.0V).
--   `/reset`: **Clear WiFi settings** and reboot. Use this to reconfigure the device via the Hotspot.
--   `/mute`: Stop sending periodic hourly reports (alerts still sent).
--   `/unmute`: Resume periodic reports.
--   `/help`: List all available commands.
+-   `/reset`: **Clear WiFi settings** and reboot to AP mode.
+-   `/mute` / `/unmute`: Control periodic reports.
+-   `/help`: List commands and current settings.
 
 ## Hardware Requirements
 
