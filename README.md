@@ -28,6 +28,7 @@ This project is an ESP8266-based battery monitoring system designed to keep trac
 -   `/setalert <minutes>` : Set Critical Alert Interval (Default 10 min).
 -   `/setreport <minutes>` : Set Periodic Report Interval (Default 60 min).
 -   `/setchemistry <type>` : Set Battery Chemistry (`lead`, `lifepo4`, `lion`).
+-   `/setwifi2 <ssid> <pass>` : Set Secondary/Backup WiFi Network.
 -   `/mute` / `/unmute` : Disable/Enable periodic reports.
 -   `/reset` : **Clear WiFi/Settings** and reboot to AP mode.
 -   `/debug <on/off>` : Toggle verbose Serial logging.
@@ -63,6 +64,7 @@ Configure the MQTT Broker (Server, Port, User, Password) via the WiFiManager por
     -   WiFi Network & Password.
     -   Telegram Bot Token & Chat ID.
     -   **MQTT Settings (Optional)**.
+    -   **Secondary WiFi**: Use `/setwifi2` command after setup.
     -   **Security**: Default passwords (`starlink`) for `admin_password` (WiFi Portal) and `ota_password` (Code Upload).
 
 6.  **Save**: The device reboots and connects.

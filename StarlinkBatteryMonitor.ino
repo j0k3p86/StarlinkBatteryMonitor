@@ -60,6 +60,12 @@ char mqtt_user[20] = "";
 char mqtt_pass[40] = "";
 char admin_password[20] = "starlink"; // Default password
 char ota_password[20] = "starlink";   // Default password
+char wifi_ssid2[32] = "";
+char wifi_pass2[64] = "";
+
+// Runtime Primary WiFi (Captured from WiFiManager)
+String primary_ssid = "";
+String primary_pass = "";
 
 // Variable to track if we should save config
 bool shouldSaveConfig = false;
@@ -99,6 +105,12 @@ unsigned long lastTimeBotRan = 0;
 // Alert States for Hysteresis
 bool lowVoltageActive = false;
 bool criticalVoltageActive = false;
+
+// Web Server Activity Tracking
+unsigned long lastWebRequestTime = 0;
+const unsigned long WEB_ACTIVE_TIMEOUT = 10000; // 10s timeout for "Active" state
+const int FAST_BOT_DELAY = 1000;
+const int SLOW_BOT_DELAY = 5000;
   
 int getBatteryPercentage(float voltage) {
   if (batteryChemistry == 1) { // LiFePO4 (4S)
@@ -242,6 +254,9 @@ void loadConfig() {
           if (json.containsKey("admin_password")) strcpy(admin_password, json["admin_password"]);
           if (json.containsKey("ota_password")) strcpy(ota_password, json["ota_password"]);
           
+          if (json.containsKey("wifi_ssid2")) strcpy(wifi_ssid2, json["wifi_ssid2"]);
+          if (json.containsKey("wifi_pass2")) strcpy(wifi_pass2, json["wifi_pass2"]);
+          
           if (json.containsKey("battery_cycles")) batteryCycles = json["battery_cycles"];
 
 
@@ -280,6 +295,8 @@ void saveConfig() {
   json["battery_cycles"] = batteryCycles;
   json["admin_password"] = admin_password;
   json["ota_password"] = ota_password;
+  json["wifi_ssid2"] = wifi_ssid2;
+  json["wifi_pass2"] = wifi_pass2;
 
   File configFile = LittleFS.open("/config.json", "w");
   if (!configFile) {
@@ -405,22 +422,28 @@ const char MAIN_PAGE[] PROGMEM = R"=====(
 )=====";
 
 void handleRoot() {
+  lastWebRequestTime = millis();
   server.send_P(200, "text/html", MAIN_PAGE);
 }
 
 void handleAPI() {
-  String json = "{";
-  json += "\"voltage\":" + String(currentVoltage, 2) + ",";
-  json += "\"percent\":" + String(getBatteryPercentage(currentVoltage)) + ",";
-  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
-  json += "\"uptime\":\"" + getUptime() + "\",";
-  json += "\"boot_count\":" + String(bootCount) + ",";
-  json += "\"cycles\":" + String(batteryCycles) + ",";
-  json += "\"tte\":" + String(tteHours) + ",";
-  json += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
-  json += "\"low_thresh\":" + String(lowBatPercent) + ",";
-  json += "\"crit_thresh\":" + String(criticalBatPercent);
-  json += "}";
+  lastWebRequestTime = millis();
+  
+  char json[512];
+  snprintf(json, sizeof(json), 
+    "{\"voltage\":%.2f,\"percent\":%d,\"rssi\":%ld,\"uptime\":\"%s\",\"boot_count\":%ld,\"cycles\":%ld,\"tte\":%.1f,\"heap\":%u,\"low_thresh\":%d,\"crit_thresh\":%d}",
+    currentVoltage,
+    getBatteryPercentage(currentVoltage),
+    WiFi.RSSI(),
+    getUptime().c_str(),
+    bootCount,
+    batteryCycles,
+    tteHours,
+    ESP.getFreeHeap(),
+    lowBatPercent,
+    criticalBatPercent
+  );
+  
   server.send(200, "application/json", json);
 }
 
@@ -560,15 +583,37 @@ void cmdSetChemistry(String chat_id, String arg) {
   }
 }
 
+void cmdSetWifi2(String chat_id, String arg) {
+  // Format: "SSID Password"
+  int spaceIndex = arg.indexOf(' ');
+  if (spaceIndex == -1) {
+    bot.sendMessage(chat_id, "❌ Usage: /setwifi2 <SSID> <Password>", "");
+    return;
+  }
+  String s2 = arg.substring(0, spaceIndex);
+  String p2 = arg.substring(spaceIndex + 1);
+  
+  if (s2.length() > 31 || p2.length() > 63) {
+    bot.sendMessage(chat_id, "❌ SSID/Pass too long.", "");
+    return;
+  }
+  
+  strcpy(wifi_ssid2, s2.c_str());
+  strcpy(wifi_pass2, p2.c_str());
+  saveConfig();
+  bot.sendMessage(chat_id, "✅ Secondary WiFi set to: " + s2, "");
+  bot.sendMessage(chat_id, "System will try this if Primary WiFi fails.", "");
+}
+
 void cmdDebug(String chat_id, String arg) {
   if (arg == "on") {
     debugMode = true;
     bot.sendMessage(chat_id, "🐞 Debug Mode ON. Check Serial Monitor.", "");
-    Serial.println("DEBUG: Enabled");
+    Serial.println(F("DEBUG: Enabled"));
   } else if (arg == "off") {
     debugMode = false;
     bot.sendMessage(chat_id, "🚫 Debug Mode OFF.", "");
-    Serial.println("DEBUG: Disabled");
+    Serial.println(F("DEBUG: Disabled"));
   } else {
     bot.sendMessage(chat_id, "❌ Usage: /debug <on/off>", "");
   }
@@ -598,7 +643,8 @@ void cmdHelp(String chat_id, String from_name) {
   welcome += "/setcritical <%> : Set Critical Threshold\n";
   welcome += "/setalert <m> : Set Alert Interval (min)\n";
   welcome += "/setreport <m> : Set Report Interval (min)\n";
-  welcome += "/setchemistry <type> : Set Battery Type (lead, lifepo4, lion)\n\n";
+  welcome += "/setchemistry <type> : Set Battery Type (lead, lifepo4, lion)\n";
+  welcome += "/setwifi2 <ssid> <pass> : Set Backup WiFi\n\n";
   welcome += "Current Settings:\n";
   welcome += "Low: " + String(lowBatPercent) + "%\n";
   welcome += "Critical: " + String(criticalBatPercent) + "%\n";
@@ -623,7 +669,7 @@ void sendDiscoveryMessage() {
   String p2 = "{\"name\":\"Starlink Battery Level\",\"uniq_id\":\"starlink_percent\",\"dev_cla\":\"battery\",\"unit_of_meas\":\"%\",\"stat_t\":\"starlink/percentage\"," + device + "}";
   mqttClient.publish("homeassistant/sensor/starlink_battery/percent/config", p2.c_str(), true);
   
-  Serial.println("MQTT Discovery Sent");
+  Serial.println(F("MQTT Discovery Sent"));
 }
 
 void handleCommand(String text, String from_name, String chat_id) {
@@ -646,6 +692,7 @@ void handleCommand(String text, String from_name, String chat_id) {
   else if (command == "/setalert") cmdSetAlert(chat_id, arg);
   else if (command == "/setreport") cmdSetReport(chat_id, arg);
   else if (command == "/setchemistry") cmdSetChemistry(chat_id, arg);
+  else if (command == "/setwifi2") cmdSetWifi2(chat_id, arg);
   else if (command == "/mute") cmdMute(chat_id);
   else if (command == "/unmute") cmdUnmute(chat_id);
   else if (command == "/debug") cmdDebug(chat_id, arg);
@@ -687,12 +734,12 @@ void setup() {
     ESP.wdtFeed(); 
   }
 
-  Serial.println("\n\n--- BATTERY MONITOR SYSTEM STARTING ---");
-  Serial.print("Reset Reason: ");
+  Serial.println(F("\n\n--- BATTERY MONITOR SYSTEM STARTING ---"));
+  Serial.print(F("Reset Reason: "));
   Serial.println(ESP.getResetReason());
-  Serial.print("Boot Version: ");
+  Serial.print(F("Boot Version: "));
   Serial.println(ESP.getBootVersion());
-  Serial.print("SDK Version: ");
+  Serial.print(F("SDK Version: "));
   Serial.println(ESP.getSdkVersion());
   
   // ESP.wdtDisable() already called at top
@@ -701,7 +748,7 @@ void setup() {
   saveCrashLog();
 
   // File System & Config
-  Serial.println("STEP: Loading Config...");
+  Serial.println(F("STEP: Loading Config..."));
   ESP.wdtFeed();
   loadConfig();
   
@@ -731,14 +778,14 @@ void setup() {
       wm.addParameter(&custom_mqtt_user);
       wm.addParameter(&custom_mqtt_pass);
       
-      Serial.println("Connecting to WiFi via WiFiManager...");
-      Serial.println("STEP: Starting AutoConnect...");
+      Serial.println(F("Connecting to WiFi via WiFiManager..."));
+      Serial.println(F("STEP: Starting AutoConnect..."));
       ESP.wdtFeed(); 
       yield();
       
       // Use a unique AP name
       if (!wm.autoConnect("StarlinkMonitor-Setup", admin_password)) {
-        Serial.println("Failed to connect. Restarting...");
+        Serial.println(F("Failed to connect. Restarting..."));
         
         ESP.restart();
       }
@@ -746,6 +793,10 @@ void setup() {
       ESP.wdtFeed();
       
       Serial.println("\nWiFi Connected!");
+      
+      // Capture Primary Credentials for Failover
+      primary_ssid = WiFi.SSID();
+      primary_pass = WiFi.psk();
       
       strcpy(bot_token, custom_bot_token.getValue());
       strcpy(chat_id, custom_chat_id.getValue());
@@ -761,8 +812,8 @@ void setup() {
   } 
   // End of WiFiManager Scope - Memory Freed
   
-  Serial.println("STEP: VM Scope Ended. Memory Freed.");
-  Serial.print("Free Heap: "); Serial.println(ESP.getFreeHeap());
+  Serial.println(F("STEP: VM Scope Ended. Memory Freed."));
+  Serial.print(F("Free Heap: ")); Serial.println(ESP.getFreeHeap());
   ESP.wdtFeed();
 
   if (shouldSaveConfig) {
@@ -800,9 +851,9 @@ void setup() {
   server.on("/api/status", handleAPI);
   
   server.begin();
-  Serial.println("STEP: Web Server Started");
+  Serial.println(F("STEP: Web Server Started"));
 
-  Serial.print("ChatID = ");
+  Serial.print(F("ChatID = "));
   Serial.println(chat_id);
 
   // OTA Setup
@@ -900,9 +951,43 @@ float readBatteryVoltageBlocking() {
   return pinVoltage * DIVIDER_RATIO * calibrationFactor;
 }
 
+// Non-blocking WiFi Reconnection with Failover
 void handleWiFiReconnection() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi disconnected. Reconnecting...");
+  if (WiFi.status() == WL_CONNECTED) return;
+  
+  static unsigned long lastReconnectAttempt = 0;
+  static int reconnectAttempts = 0;
+  static bool usingBackupWifi = false;
+  
+  unsigned long now = millis();
+  
+  // Try to reconnect every 30 seconds if connection is lost
+  if (now - lastReconnectAttempt > 30000) {
+    lastReconnectAttempt = now;
+    reconnectAttempts++;
+    
+    Serial.print(F("WiFi Disconnected. Attempt: "));
+    Serial.println(reconnectAttempts);
+
+    // If we failed 3 times, and we have a backup configured, try switching
+    if (reconnectAttempts >= 3 && strlen(wifi_ssid2) > 0) {
+       usingBackupWifi = !usingBackupWifi; // Toggle
+       reconnectAttempts = 0; // Reset counter
+       
+       if (usingBackupWifi) {
+          Serial.print(F("Switching to Backup WiFi: "));
+          Serial.println(wifi_ssid2);
+          WiFi.begin(wifi_ssid2, wifi_pass2);
+       } else {
+          Serial.print(F("Switching to Primary WiFi: "));
+          Serial.println(primary_ssid);
+          WiFi.begin(primary_ssid.c_str(), primary_pass.c_str());
+       }
+    } else {
+       // Retry current network
+       Serial.println(F("Retrying connection..."));
+       WiFi.reconnect(); 
+    }
   }
 }
 
@@ -999,7 +1084,7 @@ void loop() {
   // Startup Reporting (Moved from setup)
   if (!startupReportSent) {
      if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("STEP: Sending Startup Messages...");
+        Serial.println(F("STEP: Sending Startup Messages..."));
         
         bot.sendMessage(chat_id, "🚀 **System Started!**", "Markdown");
         ESP.wdtFeed(); yield();
@@ -1012,7 +1097,7 @@ void loop() {
         bot.sendMessage(chat_id, getStatusMessage(), "Markdown");
         ESP.wdtFeed(); yield();
         
-        Serial.println("STEP: Startup Messages Sent");
+        Serial.println(F("STEP: Startup Messages Sent"));
         startupReportSent = true;
      } else {
         // If not connected yet, we wait for next loop. 
@@ -1023,6 +1108,15 @@ void loop() {
   if (debugMode && (currentMillis % 5000 < 50)) {
      // Print a heartbeat every ~5s (dependent on loop speed, simple check)
      Serial.println("DEBUG: Loop Alive. WiFi: " + String(WiFi.status()));
+  }
+
+  // Dynamic Telegram Polling
+  // If web server was active recently, poll slowly to save CPU/Network for user.
+  // Otherwise, poll fast for responsiveness.
+  if (currentMillis - lastWebRequestTime < WEB_ACTIVE_TIMEOUT) {
+    botRequestDelay = SLOW_BOT_DELAY;
+  } else {
+    botRequestDelay = FAST_BOT_DELAY;
   }
 
   // Telegram Bot Handling
@@ -1083,12 +1177,12 @@ void loop() {
     if (currentMillis - lastReportTime >= reportInterval) {
       if (WiFi.status() == WL_CONNECTED && reportsEnabled) {
         String message = "🔋 Battery Report\nVoltage: " + String(voltage, 2) + "V (" + String(getBatteryPercentage(voltage)) + "%)";
-        Serial.println("Sending Periodic Telegram Report...");
+        Serial.println(F("Sending Periodic Telegram Report..."));
         if (bot.sendMessage(chat_id, message, "")) {
-           Serial.println("Periodic Report Sent!");
+           Serial.println(F("Periodic Report Sent!"));
            lastReportTime = currentMillis;
         } else {
-           Serial.println("Failed to send Periodic Report");
+           Serial.println(F("Failed to send Periodic Report"));
         }
       }
     }
@@ -1097,19 +1191,19 @@ void loop() {
     updateAdvancedLogic(currentPercent);
 
     if (currentPercent <= criticalBatPercent) {
-      Serial.println("ALERT: CRITICAL BATTERY!");
+      Serial.println(F("ALERT: CRITICAL BATTERY!"));
       criticalVoltageActive = true;
       
       // Send Telegram Alert (Debounced)
       if (currentMillis - lastAlertTime > alertInterval) {
         if (WiFi.status() == WL_CONNECTED) {
             String message = "🚨 CRITICAL BATTERY! Level: " + String(currentPercent) + "% (" + String(voltage, 2) + "V)";
-            Serial.println("Sending Telegram Alert...");
+            Serial.println(F("Sending Telegram Alert..."));
             if (bot.sendMessage(chat_id, message, "")) {
-              Serial.println("Critical Telegram Alert Sent!");
+              Serial.println(F("Critical Telegram Alert Sent!"));
               lastAlertTime = currentMillis;
             } else {
-              Serial.println("Failed to send Critical Telegram Alert");
+              Serial.println(F("Failed to send Critical Telegram Alert"));
             }
         }
       }
@@ -1122,7 +1216,7 @@ void loop() {
       }
 
     } else if (currentPercent <= lowBatPercent) {
-      Serial.println("ALERT: BATTERY LOW!");
+      Serial.println(F("ALERT: BATTERY LOW!"));
       lowVoltageActive = true;
       criticalVoltageActive = false; // Not critical anymore if we are just low
       
@@ -1130,12 +1224,12 @@ void loop() {
       if (currentMillis - lastAlertTime > alertInterval) {
         if (WiFi.status() == WL_CONNECTED) {
             String message = "⚠️ Battery Low! Level: " + String(currentPercent) + "% (" + String(voltage, 2) + "V)";
-            Serial.println("Sending Telegram Alert...");
+            Serial.println(F("Sending Telegram Alert..."));
             if (bot.sendMessage(chat_id, message, "")) {
-              Serial.println("Telegram Alert Sent!");
+              Serial.println(F("Telegram Alert Sent!"));
               lastAlertTime = currentMillis;
             } else {
-              Serial.println("Failed to send Telegram Alert");
+              Serial.println(F("Failed to send Telegram Alert"));
             }
         }
       }
