@@ -383,6 +383,9 @@ const char MAIN_PAGE[] PROGMEM = R"=====(
         if(p <= 10) c.style.color = '#cf6679'; // Red
         else if(p <= 20) c.style.color = '#ffb74d'; // Orange
         else c.style.color = '#03dac6'; // Teal
+        
+        let d = new Date();
+        document.getElementById('last-update').innerText = d.toLocaleTimeString();
       });
     }
     setInterval(refreshData, 5000); // Update every 5s
@@ -415,6 +418,7 @@ const char MAIN_PAGE[] PROGMEM = R"=====(
   
   <footer>
     ESP8266 Starlink Monitor<br>
+    <span style="font-size: 10px; color: #777;">Last Refreshed: <span id="last-update">--</span></span><br>
     <a href="/api/status" style="color: #555;">JSON API</a>
   </footer>
 </body>
@@ -999,7 +1003,7 @@ void reconnectMQTT() {
     Serial.print("Attempting MQTT connection...");
     // Create a random client ID
     String clientId = "StarlinkMonitor-";
-    clientId += String(random(0xffff), HEX);
+    clientId += String(ESP.getChipId(), HEX);
     
     // Attempt to connect
     bool connected = false;
