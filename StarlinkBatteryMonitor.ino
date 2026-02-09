@@ -1259,12 +1259,12 @@ void loop() {
             lastBlinkTime = currentMillis;
           }
       } else { // If currently OFF
-          if (currentMillis - lastBlinkTime >= 2000) {
-             ledState = LOW; // Turn ON
-             digitalWrite(LED_BUILTIN, ledState);
-             lastBlinkTime = currentMillis;
+        if (currentMillis - lastBlinkTime >= 2000) {
+           ledState = LOW; // Turn ON
+           digitalWrite(LED_BUILTIN, ledState);
+           lastBlinkTime = currentMillis;
+        }
       }
-    }
       }
     }
 }
