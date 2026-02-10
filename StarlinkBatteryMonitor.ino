@@ -745,6 +745,9 @@ void setup() {
   Serial.println(ESP.getBootVersion());
   Serial.print(F("SDK Version: "));
   Serial.println(ESP.getSdkVersion());
+  Serial.print(F("CPU Freq: "));
+  Serial.print(ESP.getCpuFreqMHz());
+  Serial.println(F(" MHz"));
   
   // ESP.wdtDisable() already called at top
 
