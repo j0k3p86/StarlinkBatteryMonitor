@@ -1168,7 +1168,6 @@ void loop() {
     
     Serial.print("Voltage: ");
     Serial.print(voltage);
-    Serial.print(voltage);
     Serial.println(" V");
 
     // Publish to MQTT
