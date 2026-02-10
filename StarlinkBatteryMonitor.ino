@@ -727,6 +727,8 @@ void setup() {
   ESP.wdtDisable(); // Disable Soft WDT to prevent early triggering
   ESP.wdtFeed();    // Feed Hard WDT immediately
 
+  system_update_cpu_freq(160); // Optimize for SSL Performance
+
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH); // Ensure off initially
 
