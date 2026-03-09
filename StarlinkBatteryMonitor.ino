@@ -727,7 +727,7 @@ void setup() {
   ESP.wdtDisable(); // Disable Soft WDT to prevent early triggering
   ESP.wdtFeed();    // Feed Hard WDT immediately
 
-  system_update_cpu_freq(160); // Optimize for SSL Performance
+  system_update_cpu_freq(SYS_CPU_160MHZ); // Optimize for SSL Performance
 
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH); // Ensure off initially
@@ -1267,11 +1267,11 @@ void loop() {
             lastBlinkTime = currentMillis;
           }
       } else { // If currently OFF
-        if (currentMillis - lastBlinkTime >= 2000) {
-           ledState = LOW; // Turn ON
-           digitalWrite(LED_BUILTIN, ledState);
-           lastBlinkTime = currentMillis;
-        }
+          if (currentMillis - lastBlinkTime >= 2000) {
+            ledState = LOW; // Turn ON
+            digitalWrite(LED_BUILTIN, ledState);
+            lastBlinkTime = currentMillis;
+          }
       }
       }
     }
